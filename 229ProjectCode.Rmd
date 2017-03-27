@@ -1,0 +1,905 @@
+
+```{r}
+setwd("/Users/Home/Dropbox/My Documents/Stanford University/2016-17 Fall Quarter/CS 229 Machine Learning/Project Folder/1. Data : Kernels/")
+# setwd("/Users/fjori/Dropbox/CS 229 Project/1. Data : Kernels/")
+library(readr); library(dplyr); library(glmnet); library(caret); 
+library(doMC); library(doParallel); # for parallelizing 
+library(gbm); # for gradient boosted trees 
+library(nnet); # for multinomial log-linear models, and nnet models
+library(e1071); # for SVM, naive bayes
+library(MASS); # for LDA / QDA / GDA 
+library(caret); # for tuning models
+library(devtools); library(ggbiplot); # for PCA plotting
+library(Rtsne); library(ggplot2); # for t-SNE plotting
+library(gridExtra)
+
+
+# notes 
+# --------------------------------------------------------------------- 
+# coef0 - http://stackoverflow.com/questions/21390570/scikit-learn-svc-coef0-parameter-range
+# scale = FALSE performed better than scale = TRUE (.0356 < .0403) when tried on diff seeds / costs
+# gamma - http://stats.stackexchange.com/questions/37681/use-of-the-gamma-parameter-with-support-vector-machines
+# plot data in 6 diff colors with top 2 variables as x and y
+# have not tuned tolerance = .001, shrinking = TRUE, class.weights = NULL, cross = 0.
+# don't tune on the test data. Do CV on the training data to tune the parameters.
+# how to know when to scale data?
+# t-sne to visualize high dimension data, PCA to visualize high dimension data
+# tuning gbm w caret - http://stats.stackexchange.com/questions/103495/how-to-find-optimal-values-for-the-tuning-parameters-in-boosting-trees
+# 30 participants
+# 21 out of 30 training 
+# leave 3 out, 7 fold CV
+
+
+# ------------------------------------------------------------
+# 1. Gradient Boosted Classification Trees
+# ------------------------------------------------------------
+
+# 1.A Load and Structure the Data
+rm(list = ls())
+
+# load csvs - 13s
+train_data = read.csv("train.csv")
+test_data = read.csv("test.csv")
+
+# LAYING = 1, SITTING == 2, STANDING == 3, WALKING == 4, WALKING_DOWNSTAIRS == 5, WALKING_UPSTAIRS == 6
+train_data$Activity = as.integer(train_data$Activity)
+test_data$Activity = as.integer(test_data$Activity)
+
+# remove 'subject' column from the dataframes
+train_data = train_data[, !(names(train_data) %in% "subject")] 
+test_data = test_data[, !(names(test_data) %in% "subject")]
+
+
+# 1.B Tune with Caret using a rook-search strategy iterating back and forth between 2 groups of 2 features
+# 1.5 hours for shrinkage (0.001, 0.01, 0.05, 0.1) vs. interaction depth (1,2,3,4) with 500 trees, 10 minobsinnode
+# myTuneGrid = expand.grid(n.trees = 500, interaction.depth = c(1,2,3,4), shrinkage = c(.001, .01, 0.05, .1), n.minobsinnode = 10)
+myTuneGrid = expand.grid(n.trees = c(500, 2000), interaction.depth = c(4, 8), shrinkage = c(.01, .1), n.minobsinnode = c(10, 5))
+fitControl = trainControl(method = "repeatedcv", number = 3, repeats = 1, verboseIter = TRUE, returnResamp = "all")
+
+start = Sys.time()
+activity_gbm = train(Activity ~ ., data = train_data, method = "gbm", trControl = fitControl, tuneGrid = myTuneGrid)
+end = start - Sys.time()
+
+activity_gbm
+
+
+# 1.C Build Boosting Model and Analyze
+# build model ~15 mins, for (t.f = 1, i.d = 2, shr = 0.05, n.trees = 500, bf = 0.5, cv.f = 5) - best.iter 500 so more iters first
+.005, 2500 trees
+start = Sys.time()
+activity_gbm = gbm(Activity ~., data = train_data, train.fraction = 1.0, interaction.depth = 4, shrinkage = .005, n.trees = 5000, bag.fraction = 0.5, cv.folds = 5, distribution = "multinomial", n.minobsinnode = 10, verbose = T, n.cores = 7)
+end = start - Sys.time()
+best_iter = gbm.perf(activity_gbm, method = "cv")
+
+# make predictions
+activity_predictions = predict(activity_gbm, test_data[, !(names(test_data) %in% "Activity")], n.trees = best_iter)
+predictions_matrix = matrix(activity_predictions, nrow = nrow(test_data), ncol = 6)
+predictions = apply(predictions_matrix, 1, which.max)
+
+# calc misclassification rate, and create confusion matrix
+misclassification_rate = sum(predictions != test_data$Activity) / nrow(test_data)
+misclassification_rate = round(misclassification_rate, digits = 4)
+misclassification_rate
+
+# confusion matrix
+confusion_matrix = table(predictions, test_data$Activity)
+rownames(confusion_matrix) = colnames(confusion_matrix) = c("LAYING", "SITTING", "STANDING", "WALKING", "WALKING_DOWNSTAIRS", "WALKING_UPSTAIRS")
+confusion_matrix
+
+# cals misclassification rate by activity
+misclassification_by_activity = c()
+for (i in 1:6) {
+  activity_correct = confusion_matrix[i, i]
+  activity_count = sum(confusion_matrix[, i])
+  misclassification_by_activity[i] = 1 - (activity_correct / activity_count)
+}
+round(misclassification_by_activity, digits = 3)
+
+# print important variables chart, a bit hard to read right now
+important_variables = summary(activity_gbm, las = 1, cex.axis = 1, main="RELATIVE INFLUENCE OF\n ALL PREDICTORS FOR PREDICTING \n ACTIVITY")
+
+# calculate training error as well
+train_activity_predictions = predict(activity_gbm, train_data[, !(names(train_data) %in% "Activity")], type = "response", n.trees = best_iter)
+train_predictions_matrix = matrix(train_activity_predictions, nrow = nrow(train_data), ncol = 6)
+train_predictions = apply(train_predictions_matrix, 1, which.max)
+
+train_misclassification_rate = sum(train_predictions != train_data$Activity) / nrow(train_data)
+train_misclassification_rate = round(train_misclassification_rate, digits = 4)
+train_misclassification_rate
+
+# error inspecting a bit, remove this
+errors_matrix = predictions_matrix[seq(1,2500,49), ]
+errors_matrix = round(errors_matrix, digits = 4)
+errors_vec = test_data$Activity[seq(1,2500,49)]
+errors_pred = predictions[seq(1,2500,49)]
+cbind(errors_matrix, errors_vec, errors_pred)
+
+
+
+# 1.D building GBM using the gbm.fit structure instead
+start = Sys.time()
+gbm_errors = c() 
+
+activity_gbm = gbm.fit(train_data[, !(names(train_data) %in% "Activity")], train_data$Activity, train.fraction = 1.0, interaction.depth = 4, shrinkage = .1, n.trees = 2500, bag.fraction = 0.5, distribution = "multinomial", n.minobsinnode = 10, verbose = T)
+end = start - Sys.time()
+best_iter = gbm.perf(activity_gbm, method = "cv")
+
+
+# ------------------------------------------------------------
+# 2. Neural Networks2
+# ------------------------------------------------------------
+
+# 2.A Load and Structure the Data
+rm(list = ls())
+
+# load csvs - 13s
+train_data = read.csv("train.csv")
+test_data = read.csv("test.csv")
+
+# factor --> integer works
+# LAYING = 1, SITTING == 2, STANDING == 3, WALKING == 4, WALKING_DOWNSTAIRS == 5, WALKING_UPSTAIRS == 6
+train_data$Activity = as.numeric(as.integer(train_data$Activity))
+test_data$Activity = as.numeric(as.integer(test_data$Activity))
+
+# normalize both train and test sets
+data = rbind(train_data, test_data)
+data_scaled = as.data.frame(scale(data))
+
+data_scaled$Activity = data$Activity # dont scale the y variable
+data_scaled$subject = data$subject # don't scale the subject number
+train_data_scaled = data_scaled[1:nrow(train_data), ]
+test_data_scaled = data_scaled[(nrow(train_data)+1):nrow(data_scaled), ]
+
+train_data_scaled$Activity = as.factor(train_data_scaled$Activity)
+test_data_scaled$Activity = as.factor(test_data_scaled$Activity)
+
+# for now, remove subject from the dataframes
+# train_data = train_data[, !(names(train_data) %in% "subject")] 
+# test_data = test_data[, !(names(test_data) %in% "subject")]
+
+# shuffle the rows of the training data
+# idxs = sample(nrow(train_data))
+# train_data = train_data[idxs, ]
+
+
+
+# 2.B Build NeuralNet Model and Analyze
+set.seed(1)
+
+# find opt size
+all_decays = c(0, 0.25, 0.5, 0.75, 1)
+all_sizes = c(1, 6, 11, 16, 21)
+participants = sample(unique(train_data_scaled$subject))
+participants
+nnet_errors = as.data.frame(matrix(nrow = length(all_decays), ncol = length(all_sizes)))
+start = Sys.time()
+for(i in 1:length(all_decays)) {
+  for(j in 1:length(all_sizes)) {
+    cv_errors = c()
+    for(k in 1:3) {
+      begin = Sys.time()
+      # split between train and validation subjects, remove subject as predictor variable
+      validation_subjects = participants[(k*7-6):(k*7)]
+      train_data_scaled_t = train_data_scaled[!(train_data_scaled$subject %in% validation_subjects), ]
+      train_data_scaled_t = train_data_scaled_t[, !(names(train_data_scaled_t) %in% "subject")]
+      train_data_scaled_v = train_data_scaled[train_data_scaled$subject %in% validation_subjects, ]
+      train_data_scaled_v = train_data_scaled_v[, !(names(train_data_scaled_v) %in% "subject")]
+      
+      # train model
+      activity_nn = nnet(Activity ~., data = train_data_scaled_t, size = all_sizes[j], decay.rate = all_decays[i], rang = 0.5, trace = TRUE, maxit = 250, MaxNWts = 25000)
+  
+      # make predicitons on validation subjects
+      last_col = ncol(train_data_scaled_v)
+      predictions_matrix = predict(activity_nn, train_data_scaled_v[, -last_col])
+      predictions = apply(predictions_matrix, 1, which.max)
+      
+      # calc misclassification rate, and add to container
+      this_error = sum(predictions != train_data_scaled_v$Activity) / nrow(train_data_scaled_v)
+      cv_errors = c(cv_errors, this_error)   
+      print(k)
+    }
+    misclassification_rate = round(mean(cv_errors), digits = 4)
+    end = start - Sys.time()
+    nnet_errors[i, j] = misclassification_rate
+    print(paste(i,j, misclassification_rate, " ", begin - Sys.time()))
+  }
+}
+end = start - Sys.time()
+colnames(nnet_errors) = all_sizes; rownames(nnet_errors) = all_decays;
+opt_size = nnet_errors[1, which.max(nnet_errors[1, ])]
+
+# find opt decay, given opt size
+all_decays = c(0, 0.1, 0.2, 0.3, 0.4, 0.5, 0.6, 0.7, 0.8, 0.9, 1.0)
+all_sizes = opt_size
+participants = sample(unique(train_data_scaled$subject))
+nnet_errors = as.data.frame(matrix(nrow = length(all_decays), ncol = length(all_sizes)))
+start = Sys.time()
+for(i in 1:length(all_decays)) {
+  for(j in 1:length(all_sizes)) {
+    cv_errors = c()
+    for(k in 1:3) {
+      # split between train and validation subjects, remove subject as predictor variable
+      validation_subjects = participants[(k*7-6):(k*7)]
+      train_data_scaled_t = train_data_scaled[!(train_data_scaled$subject %in% validation_subjects), ]
+      train_data_scaled_t = train_data_scaled_t[, !(names(train_data_scaled_t) %in% "subject")]
+      train_data_scaled_v = train_data_scaled[train_data_scaled$subject %in% validation_subjects, ]
+      train_data_scaled_v = train_data_scaled_v[, !(names(train_data_scaled_v) %in% "subject")]
+      
+      # train model
+      activity_nn = nnet(Activity ~., data = train_data_scaled_t, size = all_sizes[j], decay.rate = all_decays[i], rang = 0.5, trace = TRUE, maxit = 500, MaxNWts = 10000)
+  
+      # make predicitons on validation subjects
+      last_col = ncol(train_data_scaled_v)
+      predictions_matrix = predict(activity_nn, train_data_scaled_v[, -last_col])
+      predictions = apply(predictions_matrix, 1, which.max)
+      
+      # calc misclassification rate, and add to container
+      this_error = sum(predictions != train_data_scaled_v$Activity) / nrow(train_data_scaled_v)
+      cv_errors = c(cv_errors, this_error)   
+      print(k)
+    }
+
+    misclassification_rate = round(mean(cv_errors), digits = 4)
+    end = start - Sys.time()
+    nnet_errors[i, j] = misclassification_rate
+    print(paste(i,j, misclassification_rate))
+  }
+}
+end = start - Sys.time()
+colnames(nnet_errors) = all_sizes; rownames(nnet_errors) = all_decays;
+
+
+# 2.C Test Performance of Opt Model - use higher max iters?
+# remove subject from data
+train_data_scaled = train_data_scaled[, !(names(train_data_scaled) %in% "subject")]
+test_data_scaled = test_data_scaled[, !(names(test_data_scaled) %in% "subject")]
+
+# train model with opt parameters - use higher maxit
+activity_nn = nnet(Activity ~., data = train_data_scaled, size = 8, decay.rate = 0.2, rang = 0.5, trace = TRUE, maxit = 200, MaxNWts = 10000)
+
+# make predicitons on validation subjects
+last_col = ncol(test_data_scaled)
+predictions_matrix = predict(activity_nn, test_data_scaled[, -last_col])
+predictions = apply(predictions_matrix, 1, which.max)
+
+# calc misclassification rate
+misclassification_rate = sum(predictions != test_data_scaled$Activity) / nrow(test_data_scaled)
+misclassification_rate = round(misclassification_rate, digits = 4)
+misclassification_rate
+
+# build confusion matrix
+confusion_matrix = table(predictions, test_data$Activity)
+rownames(confusion_matrix) = colnames(confusion_matrix) = c("LAYING", "SITTING", "STANDING", "WALKING", "WALKING_DOWNSTAIRS", "WALKING_UPSTAIRS")
+confusion_matrix
+
+# calc misclassification rate by activity
+misclassification_by_activity = c()
+for (j in 1:6) {
+  activity_correct = confusion_matrix[j, j]
+  activity_count = sum(confusion_matrix[, j])
+  misclassification_by_activity[j] = 1 - (activity_correct / activity_count)
+}
+round(misclassification_by_activity, digits = 3)
+
+
+# ------------------------------------------------------------
+# 3. Multinomial Log-Linear Models via Neural Networks 
+# ------------------------------------------------------------
+
+# 3.A load the data
+rm(list = ls())
+
+# load csvs - 13s
+train_data = read.csv("train.csv")
+test_data = read.csv("test.csv")
+
+# factor --> integer works
+# LAYING = 1, SITTING == 2, STANDING == 3, WALKING == 4, WALKING_DOWNSTAIRS == 5, WALKING_UPSTAIRS == 6
+train_data$Activity = as.integer(train_data$Activity)
+test_data$Activity = as.integer(test_data$Activity)
+
+# for now, remove subject from the dataframes
+train_data = train_data[, !(names(train_data) %in% "subject")] 
+test_data = test_data[, !(names(test_data) %in% "subject")]
+
+
+# 3.B Build Log-Lin Model and Analyze
+# build model - 52 secs
+activity_mnnnet = multinom(Activity ~., data = train_data, maxit = 1000, trace = T, MaxNWts = 5000)
+
+# make predictions
+predictions_matrix = predict(activity_mnnnet, type = "probs", newdata = test_data)
+predictions = apply(predictions_matrix, 1, which.max)
+
+# calc misclassification rate, and create confusion matrix
+misclassification_rate = sum(predictions != test_data$Activity) / nrow(test_data)
+misclassification_rate
+
+confusion_matrix = table(predictions, test_data$Activity)
+rownames(confusion_matrix) = colnames(confusion_matrix) = c("LAYING", "SITTING", "STANDING", "WALKING", "WALKING_DOWNSTAIRS", "WALKING_UPSTAIRS")
+confusion_matrix
+
+# calc misclassification rate by activity
+misclassification_by_activity = c()
+for (i in 1:6) {
+  activity_correct = confusion_matrix[i, i]
+  activity_count = sum(confusion_matrix[, i])
+  misclassification_by_activity[i] = 1 - (activity_correct / activity_count)
+}
+round(misclassification_by_activity, digits = 3)
+
+# find most important predictors
+topModels = varImp(activity_mnnnet)
+topModels$Variables = row.names(topModels)
+topModels = topModels[order(-topModels$Overall), ]
+head(topModels, 5)
+
+
+# ------------------------------------------------------------
+# 4. Support Vector Machines
+# ------------------------------------------------------------
+
+# ------------------------------------------
+# 4.A Build Model and Analyze over linear kernels
+# ------------------------------------------
+# 4.A.1 load and structure data
+set.seed(1)
+rm(list = ls())
+
+# load csvs - 13s
+train_data = read.csv("train.csv")
+test_data = read.csv("test.csv")
+
+# factor --> integer works
+# LAYING = 1, SITTING == 2, STANDING == 3, WALKING == 4, WALKING_DOWNSTAIRS == 5, WALKING_UPSTAIRS == 6
+train_data$Activity = as.factor(as.integer(train_data$Activity)) # SVM wants a factor Y i think
+test_data$Activity = as.integer(test_data$Activity)
+
+
+# 4.A.2 tune model with linear kernel
+participants = sample(unique(train_data$subject))
+all_misclassification_rates = c()
+# all_costs = c(.001, .01, .1, 1, 10, 100, 1000) == (0.1085 0.0679 0.0605 0.0579 0.0607 0.0632 0.0632), best cost 1
+# all_costs = c(.25, .5, .75, 1, 1.5, 2, 4) == (0.0579 0.0573 0.0570 0.0579 0.0582 0.0583 0.0597), seed 1, best cost .75
+all_costs = c(.25, .5, .75, 1, 1.5, 2, 4) # == (0.0637 0.0630 0.0628 0.0631 0.0631 0.0637 0.0650), seed 2, best cost .75
+start = Sys.time()
+for(i in all_costs) {
+  cv_errors = c()
+  for(k in 1:7) {
+    # split data for cross validation, and remove subject col for training
+    validation_subjects = participants[(k*3-2):(k*3)]
+    train_data_train = train_data[!(train_data$subject %in% validation_subjects), !(names(train_data) %in% "subject")]
+    train_data_validate = train_data[train_data$subject %in% validation_subjects, !(names(train_data) %in% "subject")]
+    
+    activity_SVM = svm(Activity ~., data = train_data_train, kernel = "linear", cost = i, scale = FALSE)
+
+    # test with train data
+    last_col = length(train_data_validate)
+    predictions = predict(activity_SVM, train_data_validate[, -last_col])
+    
+    # calc misclassification rate, and create confusion matrix
+    misclassification_rate = sum(predictions != train_data_validate$Activity) / nrow(train_data_validate)
+    misclassification_rate = round(misclassification_rate, digits = 4)
+    cv_errors = c(cv_errors, misclassification_rate)
+  }
+  mean_error = round(mean(cv_errors), digits = 4)
+  all_misclassification_rates = c(all_misclassification_rates, mean_error) 
+  print(paste("For 'C' cost ", i, ": error rate ", mean_error))
+}
+end = start - Sys.time()
+plot(all_costs, all_misclassification_rates)
+
+
+# 4.A.3 test performance with optimally tuned linear kernel
+opt_cost = 0.75
+train_data = train_data[, !(names(train_data) %in% "subject")] 
+test_data = test_data[, !(names(test_data) %in% "subject")]
+activity_SVM = svm(Activity ~., data = train_data, kernel = "linear", cost = opt_cost, scale = FALSE)
+
+# print(activity_SVM)
+# summary(activity_SVM)
+
+# test with train data
+last_col = length(test_data)
+predictions = predict(activity_SVM, test_data[, -last_col])
+
+# calc misclassification rate
+misclassification_rate = sum(predictions != test_data$Activity) / nrow(test_data)
+misclassification_rate = round(misclassification_rate, digits = 4)
+misclassification_rate
+
+# create confusion matrix
+confusion_matrix = table(predictions, test_data$Activity)
+rownames(confusion_matrix) = colnames(confusion_matrix) = c("LAYING", "SITTING", "STANDING", "WALKING", "WALKING_DOWNSTAIRS", "WALKING_UPSTAIRS")
+confusion_matrix
+
+# calc misclassification rate by activity
+misclassification_by_activity = c()
+for (j in 1:6) {
+  activity_correct = confusion_matrix[j, j]
+  activity_count = sum(confusion_matrix[, j])
+  misclassification_by_activity[j] = 1 - (activity_correct / activity_count)
+}
+round(misclassification_by_activity, digits = 3)
+
+# see training error as well
+last_col = length(train_data)
+train_predictions = predict(activity_SVM, train_data[, -last_col])
+
+training_error = sum(train_predictions != train_data$Activity) / nrow(train_data)
+training_error = round(training_error, digits = 4)
+training_error
+
+
+# 4.A.4 do the hold-one-out on all 30 participants
+# first combine all data, then create containers
+all_data = rbind(train_data, test_data)
+participants = seq(1, 30, by = 1)
+# test_people = sample(unique(test_data$subject))
+user_misclassification_rate = c()
+opt_cost = 0.75 
+
+start = Sys.time()
+for(k in 1:30) {
+  # split data for cross validation, and remove subject col for training
+  validation_subjects = participants[participants != k]
+  all_data_train = all_data[(all_data$subject %in% validation_subjects), !(names(all_data) %in% "subject")]
+  all_data_validate = all_data[!(all_data$subject %in% validation_subjects), !(names(all_data) %in% "subject")]
+  activity_SVM = svm(Activity ~., data = all_data_train, kernel = "linear", cost = opt_cost, scale = FALSE)
+  
+  # test on the hold out participant
+  last_col = length(all_data_validate)
+  predictions = predict(activity_SVM, all_data_validate[, -last_col])
+
+  # calc misclassification rate, and create confusion matrix
+  this_users_error_rate = sum(predictions != all_data_validate$Activity) / nrow(all_data_validate)
+  this_users_error_rate = round(this_users_error_rate, digits = 4)
+  user_misclassification_rate = c(user_misclassification_rate, this_users_error_rate)
+  print(paste(k, round(this_users_error_rate, digits = 4)))
+  
+  # calc confusion matrix for this user
+  confusion_matrix = table(predictions, all_data_validate$Activity)
+  rownames(confusion_matrix) = colnames(confusion_matrix) = c("LAYING", "SITTING", "STANDING", "WALKING", "WALKING_DOWNSTAIRS", "WALKING_UPSTAIRS")
+  confusion_matrix
+
+# calc misclassification rate by activity
+misclassification_by_activity = c()
+for (j in 1:6) {
+  activity_correct = confusion_matrix[j, j]
+  activity_count = sum(confusion_matrix[, j])
+  misclassification_by_activity[j] = 1 - (activity_correct / activity_count)
+}
+round(misclassification_by_activity, digits = 3)
+
+  
+}
+end = start - Sys.time()
+
+# user_misclassification_rate = c(0, 0.0132, 0.0117, 0.0315, 0.0728, 0.0923, 0.0552, 0.0463, 0.066, 0.068, 0.0095, 0.025, 0.0061, 0.195, 0, 0.112, 0.0163, 0.0192, 0.0444, 0.0565, 0.0294, 0.0031, 0.0134, 0.0052, 0.0538, 0.0179, 0.0186, 0.0366, 0.0203, 0.0052)
+
+x = order(-user_misclassification_rate)
+x = factor(x, levels = x)
+y = sort(user_misclassification_rate, decreasing = TRUE)
+
+data_to_plot = data.frame(x,y)
+my_barplot = ggplot(data_to_plot, aes(x, y, fill = y)) + 
+  geom_bar(stat = "identity") + 
+  labs(x = "Experiment Participant",
+       y = "Misclassification Rate") + 
+  ggtitle("Hold-One-Out Misclassification Rates") + 
+  guides(fill=FALSE) + 
+  theme(plot.title = element_text(hjust = 0.5))
+  
+my_barplot
+
+
+# ------------------------------------------
+# 4.B Build Model and Analyze over radial basis kernel
+# ------------------------------------------
+# 4.B.1 load and structure data
+set.seed(1)
+rm(list = ls())
+
+# load csvs - 13s
+train_data = read.csv("train.csv")
+test_data = read.csv("test.csv")
+
+# factor --> integer works
+# LAYING = 1, SITTING == 2, STANDING == 3, WALKING == 4, WALKING_DOWNSTAIRS == 5, WALKING_UPSTAIRS == 6
+train_data$Activity = as.factor(as.integer(train_data$Activity)) # SVM wants a factor Y i think
+test_data$Activity = as.integer(test_data$Activity)
+
+
+# 4.B.2 tune model with radial basis kernel
+n = ncol(train_data)
+participants = sample(unique(train_data$subject))
+all_gammas = c(0.25/n, 0.5/n, 1/n, 2/n, 4/n, 8/n, 16/n)
+all_costs = c(0.5, 1, 5, 10, 20, 50, 100)
+all_misclassification_rates = as.data.frame(matrix(nrow = length(all_costs), ncol = length(all_gammas)))
+start = Sys.time()
+for(i in 1:length(all_costs)) {
+  for(j in 1:length(all_gammas)) {
+    cv_errors = c()
+    for(k in 1:7) {
+      # split data for cross validation, and remove subject col for training
+      validation_subjects = participants[(k*3-2):(k*3)]
+      train_data_train = train_data[!(train_data$subject %in% validation_subjects), !(names(train_data) %in% "subject")]
+      train_data_validate = train_data[train_data$subject %in% validation_subjects, !(names(train_data) %in% "subject")]
+      activity_SVM = svm(Activity ~., data = train_data_train, kernel = "radial", cost = all_costs[i], gamma = all_gammas[j], scale = FALSE)
+    
+      # test with train data
+      last_col = length(train_data_validate)
+      predictions = predict(activity_SVM, train_data_validate[, -last_col])
+      
+      # calc misclassification rate, and create confusion matrix
+      misclassification_rate = sum(predictions != train_data_validate$Activity) / nrow(train_data_validate)
+      cv_errors = c(cv_errors, misclassification_rate)
+    }
+    mean_error = round(mean(cv_errors), digits = 4)
+    all_misclassification_rates[i, j] = mean_error 
+    print(paste("For 'C' cost ", all_costs[i], ", gamma ", gammas_names[j], ": error rate ", mean_error))
+  }
+}
+end = start - Sys.time()
+gammas_names = c("0.25/n", "0.5/n", "1/n", "2/n", "4/n", "8/n", "16/n")
+colnames(all_misclassification_rates) = gammas_names; rownames(all_misclassification_rates) = all_costs;
+all_misclassification_rates
+
+
+# 4.B.3 build the optimal model using opt params for radial basis kernel
+n = ncol(train_data)
+opt_gamma = 4/n
+opt_cost = 20
+train_data = train_data[, !(names(train_data) %in% "subject")] 
+test_data = test_data[, !(names(test_data) %in% "subject")]
+activity_SVM = svm(Activity ~., data = train_data, kernel = "radial", cost = opt_cost, gamma = opt_gamma, scale = FALSE)
+
+# print(activity_SVM)
+# summary(activity_SVM)
+
+# test with train data
+last_col = length(test_data)
+predictions = predict(activity_SVM, test_data[, -last_col])
+
+# calc misclassification rate
+misclassification_rate = sum(predictions != test_data$Activity) / nrow(test_data)
+misclassification_rate = round(misclassification_rate, digits = 4)
+misclassification_rate
+
+# create confusion matrix
+confusion_matrix = table(predictions, test_data$Activity)
+rownames(confusion_matrix) = colnames(confusion_matrix) = c("LAYING", "SITTING", "STANDING", "WALKING", "WALKING_DOWNSTAIRS", "WALKING_UPSTAIRS")
+confusion_matrix
+
+# calc misclassification rate by activity
+misclassification_by_activity = c()
+for (j in 1:6) {
+  activity_correct = confusion_matrix[j, j]
+  activity_count = sum(confusion_matrix[, j])
+  misclassification_by_activity[j] = 1 - (activity_correct / activity_count)
+}
+round(misclassification_by_activity, digits = 3)
+
+# see training error as well
+last_col = length(train_data)
+train_predictions = predict(activity_SVM, train_data[, -last_col])
+
+training_error = sum(train_predictions != train_data$Activity) / nrow(train_data)
+training_error = round(training_error, digits = 4)
+training_error
+
+
+# ------------------------------------------
+# 4.C Build Model and Analyze over polynomial kernels
+# ------------------------------------------
+# 4.C.1 load and structure data
+set.seed(1)
+rm(list = ls())
+
+# load csvs - 13s
+train_data = read.csv("train.csv")
+test_data = read.csv("test.csv")
+
+# factor --> integer works
+# LAYING = 1, SITTING == 2, STANDING == 3, WALKING == 4, WALKING_DOWNSTAIRS == 5, WALKING_UPSTAIRS == 6
+train_data$Activity = as.factor(as.integer(train_data$Activity)) # SVM wants a factor Y i think
+test_data$Activity = as.integer(test_data$Activity)
+
+
+# 4.C.2 tune model with a polynomial kernel
+n = ncol(train_data) # http://stats.stackexchange.com/questions/37681/use-of-the-gamma-parameter-with-support-vector-machines
+# all_degrees = c(1, 2, 3, 4, 5, 6, 7)
+# all_costs = c(5, 10, 20, 50, 100, 200, 500)
+all_costs = 100; all_degrees = 2;
+all_gammas = c(0.125/n, 0.25/n, 0.5/n, 1/n, 2/n, 4/n, 8/n)
+participants = sample(unique(train_data$subject))
+participants
+all_misclassification_rates = as.data.frame(matrix(nrow = length(all_gammas), ncol = length(all_degrees)))
+start = Sys.time()
+for(i in 1:length(all_gammas)) {
+  for(j in 1:length(all_degrees)) {
+    cv_errors = c()
+    for(k in 1:3) {
+      # split data for cross validation, and remove subject col for training
+      validation_subjects = participants[(k*7-6):(k*7)]
+      train_data_train = train_data[!(train_data$subject %in% validation_subjects), !(names(train_data) %in% "subject")]
+      train_data_validate = train_data[train_data$subject %in% validation_subjects, !(names(train_data) %in% "subject")]
+      activity_SVM = svm(Activity ~., data = train_data_train, kernel = "polynomial", gamma = all_gammas[i], cost = all_costs, degree = all_degrees, scale = FALSE)
+    
+      # test with train data
+      last_col = length(train_data_validate)
+      predictions = predict(activity_SVM, train_data_validate[, -last_col])
+      
+      # calc misclassification rate, and create confusion matrix
+      misclassification_rate = sum(predictions != train_data_validate$Activity) / nrow(train_data_validate)
+      cv_errors = c(cv_errors, misclassification_rate)
+    }
+    mean_error = round(mean(cv_errors), digits = 4)
+    all_misclassification_rates[i, j] = mean_error 
+    print(paste("For gamma ", all_gammas[i], ": error rate ", mean_error))
+  }
+}
+end = start - Sys.time()
+colnames(all_misclassification_rates) = all_degrees; rownames(all_misclassification_rates) = all_costs;
+all_misclassification_rates
+
+
+# 4.C.3 build the optimal model using opt params for polynomial kernel
+n = ncol(train_data)
+opt_gamma = 1/n
+opt_cost = 100
+opt_degree = 2
+train_data = train_data[, !(names(train_data) %in% "subject")] 
+test_data = test_data[, !(names(test_data) %in% "subject")]
+activity_SVM = svm(Activity ~., data = train_data, kernel = "polynomial", cost = opt_cost, gamma = opt_gamma, degree = opt_degree, scale = FALSE)
+
+# print(activity_SVM)
+# summary(activity_SVM)
+
+# test with train data
+last_col = length(test_data)
+predictions = predict(activity_SVM, test_data[, -last_col])
+
+# calc misclassification rate
+misclassification_rate = sum(predictions != test_data$Activity) / nrow(test_data)
+misclassification_rate = round(misclassification_rate, digits = 4)
+misclassification_rate
+
+# create confusion matrix
+confusion_matrix = table(predictions, test_data$Activity)
+rownames(confusion_matrix) = colnames(confusion_matrix) = c("LAYING", "SITTING", "STANDING", "WALKING", "WALKING_DOWNSTAIRS", "WALKING_UPSTAIRS")
+confusion_matrix
+
+# calc misclassification rate by activity
+misclassification_by_activity = c()
+for (j in 1:6) {
+  activity_correct = confusion_matrix[j, j]
+  activity_count = sum(confusion_matrix[, j])
+  misclassification_by_activity[j] = 1 - (activity_correct / activity_count)
+}
+round(misclassification_by_activity, digits = 3)
+
+# see training error as well
+last_col = length(train_data)
+train_predictions = predict(activity_SVM, train_data[, -last_col])
+
+training_error = sum(train_predictions != train_data$Activity) / nrow(train_data)
+training_error = round(training_error, digits = 4)
+training_error
+
+
+# ------------------------------------------------------------
+# 5. Gaussian / Linear Discriminant Analysis (think Gaussian is GDA)
+# ------------------------------------------------------------
+
+# 5.A Load and Structure the Data
+rm(list = ls())
+
+# load csvs - 13s
+train_data = read.csv("train.csv")
+test_data = read.csv("test.csv")
+
+# factor --> integer works
+# LAYING = 1, SITTING == 2, STANDING == 3, WALKING == 4, WALKING_DOWNSTAIRS == 5, WALKING_UPSTAIRS == 6
+train_data$Activity = as.factor(as.integer(train_data$Activity)) # SVM wants a factor Y i think
+test_data$Activity = as.integer(test_data$Activity)
+
+# for now, remove subject from the dataframes
+train_data = train_data[, !(names(train_data) %in% "subject")] 
+test_data = test_data[, !(names(test_data) %in% "subject")]
+
+
+# 5.B build QDA Model and Analyze
+activity_QDA = qda(Activity ~., data = train_data, method = "t", scale = TRUE)
+
+last_col = length(test_data)
+predictions = predict(activity_QDA, test_data[, -last_col])
+  
+# calc misclassification rate, and create confusion matrix
+misclassification_rate = sum(predictions != test_data$Activity) / nrow(test_data)
+misclassification_rate
+  
+confusion_matrix = table(predictions, test_data$Activity)
+rownames(confusion_matrix) = colnames(confusion_matrix) = c("LAYING", "SITTING", "STANDING", "WALKING", "WALKING_DOWNSTAIRS", "WALKING_UPSTAIRS")
+confusion_matrix
+  
+# calc misclassification rate by activity
+misclassification_by_activity = c()
+for (i in 1:6) {
+  activity_correct = confusion_matrix[i, i]
+  activity_count = sum(confusion_matrix[, i])
+  misclassification_by_activity[i] = 1 - (activity_correct / activity_count)
+}
+round(misclassification_by_activity, digits = 3)
+
+
+# ------------------------------------------------------------
+# 6. Visualize Data
+# ------------------------------------------------------------
+
+# https://www.r-bloggers.com/computing-and-visualizing-pca-in-r/
+# 7.A Load and Structure the Data
+rm(list = ls())
+
+# load csvs - 13s
+train_data = read.csv("train.csv")
+test_data = read.csv("test.csv")
+
+# LAYING = 1, SITTING == 2, STANDING == 3, WALKING == 4, WALKING_DOWNSTAIRS == 5, WALKING_UPSTAIRS == 6
+# train_data$Activity = as.integer(train_data$Activity)
+# test_data$Activity = as.integer(test_data$Activity)
+
+
+# 7.B PCA 
+# remove 'subject' column from the dataframes
+train_data = train_data[, !(names(train_data) %in% "subject")] 
+test_data = test_data[, !(names(test_data) %in% "subject")]
+
+# build PCA 
+X = train_data[, !(names(train_data) %in% "Activity")]
+Y = train_data$Activity
+activity_PCA = prcomp(X, center = FALSE, scale. = FALSE) 
+
+# The print method returns the standard deviation of each of the PCs, and their rotation (or loadings), which are the coefficients of the linear combinations of the continuous variables.
+print(activity_PCA)
+
+# The plot method returns a plot of the variances (y-axis) associated with the PCs (x-axis). The Figure below is useful to decide how many PCs to retain for further analysis.
+plot(activity_PCA, type = "l")
+
+# The summary method describe the importance of the PCs. The first row describe again the standard deviation associated with each PC. The second row shows the proportion of the variance in the data explained by each component while the third row describe the cumulative proportion of explained variance.
+summary(activity_PCA)
+
+# The Figure below is a biplot generated by the function ggbiplot of the ggbiplot package available on github. It projects the data on the first two PCs. Other PCs can be chosen through the argument choices of the function. It colors each point according to the flowers’ species and draws a Normal contour line with ellipse.prob probability (default to {68\%}) for each group.
+g = ggbiplot(activity_PCA, obs.scale = 1, var.scale = 1, 
+             groups = Y, ellipse = TRUE, ellipse.prob = c(.95),
+             circle = TRUE, alpha = 0.6, var.axes = FALSE)
+g = g + scale_color_discrete(name = '')
+g = g + theme(legend.direction = 'horizontal', 
+               legend.position = 'top')
+print(g)
+
+
+# 7.C t-SNE
+# PCA vs t-SNE differences description
+# https://www.kaggle.com/puyokw/digit-recognizer/clustering-in-2-dimension-using-tsne/comments
+# remove 'subject' column from the dataframes
+train_data = train_data[, !(names(train_data) %in% "subject")] 
+test_data = test_data[, !(names(test_data) %in% "subject")]
+
+# build the tSNE object
+X = train_data[, !(names(train_data) %in% "Activity")]
+activity_tSNE = Rtsne(as.matrix(X), dims = 2, perplexity = 30, theta = 0.0, verbose = TRUE, max_iter = 1500)
+
+# visualizing
+plot_df = as.data.frame(activity_tSNE$Y);
+my_plot = qplot(V1, V2, data = plot_df, color = train_data$Activity, size = I(0.6), alpha = I(0.6), xlim = c(-95, 95), ylim = c(-90, 105), xlab = "t-SNE dimension 1", ylab = "t-SNE dimension 2")
+
+my_plot = my_plot + theme(legend.direction = 'horizontal', legend.position = "top")
+my_plot + scale_color_discrete(name = '')
+
+# 7.C.2 blob analysis
+# have to reload the data with subject
+train_data = read.csv("train.csv")
+test_data = read.csv("test.csv")
+
+Activities = unique(train_data$Activity)
+all_plots = list()
+
+i = 1
+blob_df1 = as.data.frame(activity_tSNE$Y);
+blob_df1 = blob_df1[train_data$Activity == Activities[i], ]
+sum(is.na(blob_df1)); print(Activities[i])
+
+#      
+my_plot = qplot(V1, V2, data = blob_df1, color = as.factor(train_data$subject[train_data$Activity == Activities[i]]+859), size = I(0.75), alpha = I(1),  xlim = c(-90, 105), ylim = c(-90, 52), ylab = " ", xlab = " ") + guides(color = FALSE, size = FALSE)
+my_plot
+# all_plots[[i]] = my_plot
+
+i = 2
+blob_df2 = as.data.frame(activity_tSNE$Y);
+blob_df2 = blob_df2[train_data$Activity == Activities[i], ]
+sum(is.na(blob_df2)); print(Activities[i])
+    
+my_plot2 = qplot(V1, V2, data = blob_df2, color = as.factor(train_data$subject[train_data$Activity == Activities[i]]), size = I(1.25), alpha = I(1), ylab = " ", xlab = paste(Activities[i])) + guides(color = FALSE, size = FALSE)
+my_plot2
+all_plots[[i]] = my_plot2
+
+i = 3
+blob_df = as.data.frame(activity_tSNE$Y);
+blob_df = blob_df[train_data$Activity == Activities[i], ]
+sum(is.na(blob_df))
+    
+my_plot3 = qplot(V1, V2, data = blob_df, color = as.factor(train_data$subject[train_data$Activity == Activities[i]]), size = I(1.2), alpha = I(0.75), ylab = " ", xlab = paste(Activities[i])) + guides(color = FALSE, size = FALSE)
+my_plot3
+all_plots[[i]] = my_plot3
+
+i = 4
+blob_df = as.data.frame(activity_tSNE$Y);
+blob_df = blob_df[train_data$Activity == Activities[i], ]
+sum(is.na(blob_df))
+    
+# 
+my_plot4 = qplot(V1, V2, data = blob_df, color = as.factor(train_data$subject[train_data$Activity == Activities[i]]), size = I(0.75), alpha = I(0.75),  xlim = c(-90, 105), ylim = c(-90, 52), ylab = " ", xlab = " ") + guides(color = FALSE, size = FALSE)
+my_plot4
+# all_plots[[i]] = my_plot4
+
+i = 5
+blob_df = as.data.frame(activity_tSNE$Y);
+blob_df = blob_df[train_data$Activity == Activities[i], ]
+sum(is.na(blob_df))
+    
+my_plot5 = qplot(V1, V2, data = blob_df, color = as.factor(train_data$subject[train_data$Activity == Activities[i]]), size = I(1.2), alpha = I(0.75), ylab = " ", xlab = paste(Activities[i])) + guides(color = FALSE, size = FALSE)
+my_plot5
+all_plots[[i]] = my_plot5
+
+
+i = 6
+blob_df = as.data.frame(activity_tSNE$Y);
+blob_df = blob_df[train_data$Activity == Activities[i], ]
+sum(is.na(blob_df))
+    
+my_plot6 = qplot(V1, V2, data = blob_df, color = as.factor(train_data$subject[train_data$Activity == Activities[i]]), size = I(1.2), alpha = I(0.75), ylab = " ", xlab = paste(Activities[i])) + guides(color = FALSE, size = FALSE)
+my_plot6
+all_plots[[i]] = my_plot6  
+
+
+# 7.D blob analysis
+# dont remove 'subject' column from the dataframes
+# train_data = train_data[, !(names(train_data) %in% "subject")] 
+#test_data = test_data[, !(names(test_data) %in% "subject")]
+
+# build tSNE object
+X = train_data[, !(names(train_data) %in% "Activity")]
+activity_tSNE = Rtsne(as.matrix(X), dims = 2, perplexity = 30, theta = 0.75, verbose = TRUE, max_iter = 1500)
+
+
+
+
+# 7.E show histograms of a few variables to see if they are gaussian
+this_feature = train_data[, 6]
+min = range(this_feature)[1]; max = range(this_feature)[2]
+breaks = seq(min, max, length.out = 61)
+hist(this_feature, breaks)
+
+# 7.C fitdistrplus
+fit.norm = fitdist(train_data[, !(names(train_data) %in% "Activity")], "norm")
+
+
+# Projecting the train data
+require(caret)
+ trans = preProcess(train_data[,!(names(train_data) %in% c("Activity", "subject"))], 
+                    method=c( "center", "scale", "pca"))
+PC = predict(trans, train_data[,!(names(train_data) %in% c("Activity", "subject"))])
+# uses the nr of PCs needed to explain at least 95% of the variance
+
+#  dim(PC)=[ 7352  102]
+
+# ------------------------------------------------------------
+
+```
+
+
+
+
+
+
